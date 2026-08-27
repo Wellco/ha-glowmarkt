@@ -7,8 +7,8 @@ import logging
 import requests
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
+from homeassistant.core import CoreState, Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .const import CONF_DAILY_INTERVAL, CONF_TARIFF_INTERVAL, DOMAIN
@@ -18,6 +18,26 @@ from .history import async_history_statistics_loop
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+
+def _async_start_history_loop(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    glowmarkt: GlowClient,
+    _event: Event | None = None,
+) -> None:
+    """Start history processing after Home Assistant has completed startup."""
+    if entry.entry_id not in hass.data.get(DOMAIN, {}):
+        return
+
+    hass.data[DOMAIN][entry.entry_id]["history_task"] = (
+        entry.async_create_background_task(
+            hass,
+            async_history_statistics_loop(hass, glowmarkt),
+            f"{DOMAIN}_history_statistics",
+            eager_start=False,
+        )
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -59,9 +79,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    hass.data[DOMAIN][entry.entry_id]["history_task"] = hass.async_create_task(
-        async_history_statistics_loop(hass, glowmarkt)
-    )
+    if hass.state is CoreState.running:
+        _async_start_history_loop(hass, entry, glowmarkt)
+    else:
+        @callback
+        def _on_hass_started(event: Event) -> None:
+            _async_start_history_loop(hass, entry, glowmarkt, event)
+
+        entry.async_on_unload(
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED,
+                _on_hass_started,
+            )
+        )
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
     return True
 

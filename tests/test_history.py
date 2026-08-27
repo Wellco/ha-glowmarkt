@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from pytest_homeassistant_custom_component.components.recorder.common import (
@@ -22,6 +23,46 @@ from tests.fakes import (
     FakeGlowVirtualEntity,
     fake_reading,
 )
+
+
+def test_history_metadata_sets_supported_unit_class() -> None:
+    target = history.HistoryStatisticTarget(
+        virtual_entity=SimpleNamespace(id="ve-1", name="Site 1"),
+        resource=FakeGlowResource(
+            "dcc-import",
+            const.ELEC_CONSUMPTION_CLASSIFIER,
+            "electricity consumption DCC SM profile reads",
+        ),
+        supply="electricity",
+        role="import",
+    )
+
+    with patch.object(history, "_SUPPORTS_UNIT_CLASS", True):
+        metadata = history._history_metadata(target)
+
+    assert metadata["unit_class"] == "energy"
+
+
+def test_history_metadata_sets_null_unit_class_for_currency() -> None:
+    target = history.HistoryStatisticTarget(
+        virtual_entity=SimpleNamespace(id="ve-1", name="Site 1"),
+        resource=FakeGlowResource(
+            "dcc-import-cost",
+            const.ELEC_COST_CLASSIFIER,
+            "electricity cost DCC SM profile reads",
+            base_unit="pence",
+        ),
+        supply="electricity",
+        role="cost",
+        statistic_unit="GBP",
+        value_scale=0.01,
+    )
+
+    with patch.object(history, "_SUPPORTS_UNIT_CLASS", True):
+        metadata = history._history_metadata(target)
+
+    assert "unit_class" in metadata
+    assert metadata["unit_class"] is None
 
 
 def test_fetch_half_hour_history_uses_exclusive_end_boundary() -> None:

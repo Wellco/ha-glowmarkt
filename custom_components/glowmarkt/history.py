@@ -24,40 +24,52 @@ from .mapping import (
 _LOGGER = logging.getLogger(__name__)
 
 try:
-    from homeassistant.components.recorder.models.statistics import StatisticMeanType
-except ImportError:  # pragma: no cover - older Home Assistant core
-    StatisticMeanType = None
+    from homeassistant.components.recorder.models import StatisticMeanType
+except ImportError:  # pragma: no cover - Home Assistant < 2026.4
+    try:
+        from homeassistant.components.recorder.models.statistics import StatisticMeanType
+    except ImportError:  # pragma: no cover - recorder unavailable
+        StatisticMeanType = None
 
 
-def _statistics_meta_supports_mean_type() -> bool:
-    """Return whether the running Home Assistant recorder accepts mean_type."""
-    if StatisticMeanType is None:
-        return False
-
+def _statistics_meta_supports_field(field_name: str) -> bool:
+    """Return whether the running Home Assistant recorder metadata has a field."""
     try:
         from homeassistant.components.recorder.db_schema import StatisticsMeta
     except ImportError:  # pragma: no cover - recorder unavailable
         return False
 
-    try:
-        StatisticsMeta.from_meta(
-            {
-                "has_mean": False,
-                "mean_type": int(StatisticMeanType.NONE),
-                "has_sum": True,
-                "name": None,
-                "source": DOMAIN,
-                "statistic_id": f"{DOMAIN}:compat_probe",
-                "unit_of_measurement": None,
-            }
-        )
-    except TypeError:
-        return False
+    return field_name in StatisticsMeta.__table__.columns
 
-    return True
+
+def _statistics_meta_supports_mean_type() -> bool:
+    """Return whether the running Home Assistant recorder accepts mean_type."""
+    return StatisticMeanType is not None and _statistics_meta_supports_field(
+        "mean_type"
+    )
+
+
+def _statistics_meta_supports_unit_class() -> bool:
+    """Return whether the running Home Assistant recorder accepts unit_class."""
+    return _statistics_meta_supports_field("unit_class")
+
+
+def _statistics_unit_class(unit_of_measurement: str | None) -> str | None:
+    """Return the Home Assistant statistics unit class for a unit, if any."""
+    try:
+        from homeassistant.components.recorder.statistics import (
+            STATISTIC_UNIT_TO_UNIT_CONVERTER,
+        )
+    except ImportError:  # pragma: no cover - recorder unavailable
+        return None
+
+    if (converter := STATISTIC_UNIT_TO_UNIT_CONVERTER.get(unit_of_measurement)) is None:
+        return None
+    return converter.UNIT_CLASS
 
 
 _SUPPORTS_MEAN_TYPE = _statistics_meta_supports_mean_type()
+_SUPPORTS_UNIT_CLASS = _statistics_meta_supports_unit_class()
 
 _HISTORY_CHUNK_DAYS = 10
 _INITIAL_HISTORY_DAYS = 400
@@ -104,6 +116,19 @@ def _recorder_statistics_api():
     return async_add_external_statistics, get_metadata, statistics_during_period
 
 
+async def _async_recorder_executor_job(hass: HomeAssistant, target):
+    """Run a recorder database query on its dedicated executor when available."""
+    try:
+        from homeassistant.components.recorder.util import get_instance
+    except ImportError:  # pragma: no cover - recorder unavailable
+        return await hass.async_add_executor_job(target)
+
+    recorder = get_instance(hass)
+    if (executor_job := getattr(recorder, "async_add_executor_job", None)) is not None:
+        return await executor_job(target)
+    return await hass.async_add_executor_job(target)
+
+
 def _slug_token(value: str | None) -> str:
     """Return a recorder-safe slug token."""
     slug = re.sub(r"[^0-9a-z_]+", "_", (value or "").lower())
@@ -129,7 +154,9 @@ def _history_metadata(target: HistoryStatisticTarget):
         "unit_of_measurement": target.statistic_unit,
     }
     if _SUPPORTS_MEAN_TYPE:
-        metadata["mean_type"] = int(StatisticMeanType.NONE)
+        metadata["mean_type"] = StatisticMeanType.NONE
+    if _SUPPORTS_UNIT_CLASS:
+        metadata["unit_class"] = _statistics_unit_class(target.statistic_unit)
     return metadata
 
 
@@ -239,7 +266,8 @@ async def _existing_statistic_sum_before(
     start: datetime,
 ) -> float:
     """Return the latest known cumulative sum before a refresh window."""
-    rows = await hass.async_add_executor_job(
+    rows = await _async_recorder_executor_job(
+        hass,
         partial(
             statistics_during_period,
             hass,
@@ -467,7 +495,8 @@ async def async_import_history_statistics(
 
     statistic_ids = {target.statistic_id for target in targets}
     try:
-        existing_metadata = await hass.async_add_executor_job(
+        existing_metadata = await _async_recorder_executor_job(
+            hass,
             partial(
                 get_metadata,
                 hass,

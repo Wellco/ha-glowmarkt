@@ -400,6 +400,7 @@ async def _delayed_first_refresh(coordinator: DataUpdateCoordinator, delay: int 
 
 def _cached_coordinator(
     hass: HomeAssistant,
+    entry: ConfigEntry,
     resource,
     cache: dict[str, DataUpdateCoordinator],
     create: Callable[[object], DataUpdateCoordinator],
@@ -409,12 +410,18 @@ def _cached_coordinator(
     if coordinator is None:
         coordinator = create(resource)
         cache[resource.id] = coordinator
-        hass.async_create_task(_delayed_first_refresh(coordinator, 5))
+        entry.async_create_background_task(
+            hass,
+            _delayed_first_refresh(coordinator, 5),
+            f"{DOMAIN}_initial_refresh_{resource.id}",
+            eager_start=False,
+        )
     return coordinator
 
 
 def _daily_coordinator_for_resource(
     hass: HomeAssistant,
+    entry: ConfigEntry,
     resource,
     daily_interval: int,
     daily_coordinators: dict[str, DataCoordinator],
@@ -422,6 +429,7 @@ def _daily_coordinator_for_resource(
     """Return a cached daily coordinator for a resource."""
     coordinator = _cached_coordinator(
         hass,
+        entry,
         resource,
         daily_coordinators,
         lambda current_resource: DataCoordinator(
@@ -433,6 +441,7 @@ def _daily_coordinator_for_resource(
 
 def _tariff_coordinator_for_resource(
     hass: HomeAssistant,
+    entry: ConfigEntry,
     resource,
     tariff_interval: int,
     tariff_coordinators: dict[str, TariffCoordinator],
@@ -440,6 +449,7 @@ def _tariff_coordinator_for_resource(
     """Return a cached tariff coordinator for a resource."""
     coordinator = _cached_coordinator(
         hass,
+        entry,
         resource,
         tariff_coordinators,
         lambda current_resource: TariffCoordinator(
@@ -508,6 +518,7 @@ def _reconcile_tariff_entity_registry(
 
 def _build_meter_entities(
     hass: HomeAssistant,
+    entry: ConfigEntry,
     plan: MeterPlan,
     *,
     daily_interval: int,
@@ -520,7 +531,7 @@ def _build_meter_entities(
     tariff_resource = plan.cost_resource or plan.usage_resource
     usage_sensor = GlowSensor(
         _daily_coordinator_for_resource(
-            hass, plan.usage_resource, daily_interval, daily_coordinators
+            hass, entry, plan.usage_resource, daily_interval, daily_coordinators
         ),
         plan.usage_resource,
         plan.virtual_entity,
@@ -529,7 +540,7 @@ def _build_meter_entities(
     entities = [usage_sensor]
 
     tariff_coordinator = _tariff_coordinator_for_resource(
-        hass, tariff_resource, tariff_interval, tariff_coordinators
+        hass, entry, tariff_resource, tariff_interval, tariff_coordinators
     )
     entities.extend(
         [
@@ -555,6 +566,7 @@ def _build_meter_entities(
             GlowSensor(
                 _daily_coordinator_for_resource(
                     hass,
+                    entry,
                     plan.cost_resource,
                     daily_interval,
                     daily_coordinators,
@@ -571,6 +583,7 @@ def _build_meter_entities(
             GlowSensor(
                 _daily_coordinator_for_resource(
                     hass,
+                    entry,
                     plan.export_resource,
                     daily_interval,
                     daily_coordinators,
@@ -652,6 +665,7 @@ async def async_setup_entry(
             entities.extend(
                 _build_meter_entities(
                     hass,
+                    entry,
                     plan,
                     daily_interval=daily_interval,
                     tariff_interval=tariff_interval,
