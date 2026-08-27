@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 import sys
 
@@ -29,6 +30,60 @@ def _reading_total(readings) -> float:
     return round(
         sum(reading[1].value for reading in readings if reading[1].value is not None), 3
     )
+
+
+def _to_plain_data(value):
+    """Convert Glow namespace objects into JSON-serializable data."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_to_plain_data(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _to_plain_data(item) for key, item in value.items()}
+    if hasattr(value, "__dict__"):
+        return {
+            key: _to_plain_data(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return value
+
+
+def _print_tariff_list(prefix: str, resource) -> int:
+    """Fetch and print the Glow tariff-history payload for a resource."""
+    try:
+        tariff_list = resource.get_tariff_list()
+    except Exception as ex:  # pylint: disable=broad-except
+        print(f"{prefix}tariff-list failed: {type(ex).__name__}: {ex}")
+        return 1
+
+    print(f"{prefix}tariff-list:")
+    plain_data = _to_plain_data(tariff_list)
+    formatted = json.dumps(plain_data, indent=2, sort_keys=True)
+    for line in formatted.splitlines():
+        print(f"{prefix}  {line}")
+    return 0
+
+
+def _print_supply_tariff_list(
+    prefix: str,
+    *,
+    usage_resource,
+    cost_resource,
+) -> int:
+    """Print tariff-list for the canonical cost resource when available."""
+    if cost_resource is None:
+        if usage_resource is None:
+            print(f"{prefix}tariff-list: skipped (no canonical resource selected)")
+        else:
+            print(
+                f"{prefix}tariff-list: skipped (Glow only serves tariff-list for "
+                "cost resources, and no canonical cost resource was selected)"
+            )
+        return 0
+
+    print(f"{prefix}tariff-list resource: {_resource_summary(cost_resource)}")
+    return _print_tariff_list(prefix, cost_resource)
 
 
 def _print_readings(prefix: str, readings, *, show_buckets: bool) -> None:
@@ -86,6 +141,72 @@ def _print_recent_readings(
         )
 
 
+def _daily_sensor_total(readings) -> float | None:
+    """Mirror the integration's daily sensor aggregation for P1D readings."""
+    if not readings:
+        return None
+
+    value = float(readings[0][1].value)
+    if len(readings) > 1:
+        value += float(readings[1][1].value)
+    return value
+
+
+def _print_today_summary(
+    prefix: str,
+    resource,
+    *,
+    value_scale: float = 1.0,
+    display_unit: str | None = None,
+) -> int:
+    """Print the current-day P1D summary that backs the HA daily sensors."""
+    now = datetime.now().astimezone()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = now.replace(second=0, microsecond=0)
+
+    try:
+        readings = resource.get_readings(start, end, "P1D", "sum")
+    except Exception as ex:  # pylint: disable=broad-except
+        print(f"{prefix}today P1D failed: {type(ex).__name__}: {ex}")
+        return 1
+
+    if not readings:
+        print(
+            f"{prefix}today P1D: no readings returned in "
+            f"{start.isoformat()} to {end.isoformat()}"
+        )
+        return 0
+
+    total = _daily_sensor_total(readings)
+    unit = readings[0][1].unit()
+    print(
+        f"{prefix}today P1D: raw {total} {unit} from {len(readings)} reading(s) "
+        f"between {start.isoformat()} and {end.isoformat()}"
+    )
+
+    scaled_total = total * value_scale
+    scaled_unit = display_unit or unit
+    if value_scale != 1.0 or scaled_unit != unit:
+        print(f"{prefix}today P1D as HA value: {round(scaled_total, 4)} {scaled_unit}")
+
+    return 0
+
+
+def _print_last_time(prefix: str, label: str, resource) -> tuple[int, datetime | None]:
+    """Fetch and print the Glow last-time value for one resource."""
+    try:
+        last_time = resource.get_last_time()
+    except Exception as ex:  # pylint: disable=broad-except
+        print(f"{prefix}{label} last-time failed: {type(ex).__name__}: {ex}")
+        return 1, None
+
+    print(
+        f"{prefix}{label} last-time: "
+        f"{last_time.isoformat() if last_time is not None else 'none'}"
+    )
+    return 0, last_time
+
+
 def _run_catchup_smoke(resource, *, dcc_context_resource=None) -> int:
     """Trigger one Glow DCC catchup request for a resource."""
     refresh_resource = dcc_context_resource
@@ -127,21 +248,32 @@ def _run_resource_smoke(
         )
 
     try:
+        failures += _print_today_summary(
+            "      ",
+            resource,
+            value_scale=value_scale,
+            display_unit=statistic_unit,
+        )
+
         end = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0)
+        resource_last_time_failures, resource_last_time = _print_last_time(
+            "      ", "resource", resource
+        )
+        failures += resource_last_time_failures
         refresh_resource = dcc_context_resource
         if refresh_resource is None and getattr(resource, "is_dcc_sourced", False):
             refresh_resource = resource
         if refresh_resource is not None:
+            last_time = resource_last_time
             if refresh_resource.id != resource.id:
                 print(
                     "      freshness context: "
                     f"{refresh_resource.id} | {refresh_resource.classifier}"
                 )
-            last_time = refresh_resource.get_last_time()
-            print(
-                "      last-time: "
-                f"{last_time.isoformat() if last_time is not None else 'none'}"
-            )
+                context_last_time_failures, last_time = _print_last_time(
+                    "      ", "freshness context", refresh_resource
+                )
+                failures += context_last_time_failures
             useful_end = history_module._useful_history_end(end, last_time)
             if useful_end != end:
                 print(
@@ -240,6 +372,14 @@ def main():
             "before requesting half-hour history."
         ),
     )
+    parser.add_argument(
+        "--show-tariff-list",
+        action="store_true",
+        help=(
+            "Print the Glow tariff-list payload for each canonical meter cost "
+            "resource."
+        ),
+    )
     args = parser.parse_args()
 
     client = GlowClient(args.username, args.password)
@@ -292,6 +432,12 @@ def main():
                     "resource was selected"
                 )
         else:
+            if args.show_tariff_list:
+                failures += _print_supply_tariff_list(
+                    "    ",
+                    usage_resource=electricity.usage,
+                    cost_resource=electricity.cost,
+                )
             for role_name, resource in (
                 ("import", electricity.usage),
                 ("cost", electricity.cost),
@@ -330,6 +476,12 @@ def main():
                 )
             continue
 
+        if args.show_tariff_list:
+            failures += _print_supply_tariff_list(
+                "    ",
+                usage_resource=gas.usage,
+                cost_resource=gas.cost,
+            )
         for role_name, resource in (("usage", gas.usage), ("cost", gas.cost)):
             if resource is None:
                 print(f"    {role_name}: not selected")

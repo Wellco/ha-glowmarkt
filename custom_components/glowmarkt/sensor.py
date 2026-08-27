@@ -18,6 +18,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -448,6 +449,63 @@ def _tariff_coordinator_for_resource(
     return coordinator
 
 
+@callback
+def _reconcile_tariff_entity_registry(
+    entity_registry: er.EntityRegistry,
+    config_entry_id: str,
+    plan: MeterPlan,
+) -> None:
+    """Migrate legacy tariff entity unique IDs onto the canonical tariff resource."""
+    tariff_resource = plan.cost_resource or plan.usage_resource
+    if tariff_resource.id == plan.usage_resource.id:
+        return
+
+    for suffix in (
+        STANDING_SENSOR.unique_id_suffix,
+        RATE_SENSOR.unique_id_suffix,
+    ):
+        old_unique_id = f"{plan.usage_resource.id}_{suffix}"
+        new_unique_id = f"{tariff_resource.id}_{suffix}"
+
+        old_entity_id = entity_registry.async_get_entity_id("sensor", DOMAIN, old_unique_id)
+        if old_entity_id is None:
+            continue
+
+        old_entry = entity_registry.async_get(old_entity_id)
+        if old_entry is None or old_entry.config_entry_id != config_entry_id:
+            continue
+
+        new_entity_id = entity_registry.async_get_entity_id("sensor", DOMAIN, new_unique_id)
+        if new_entity_id is None:
+            _LOGGER.debug(
+                "Migrating tariff entity %s unique_id from %s to %s",
+                old_entity_id,
+                old_unique_id,
+                new_unique_id,
+            )
+            entity_registry.async_update_entity(
+                old_entity_id, new_unique_id=new_unique_id
+            )
+            continue
+
+        new_entry = entity_registry.async_get(new_entity_id)
+        if new_entry is None or new_entry.config_entry_id != config_entry_id:
+            continue
+
+        _LOGGER.debug(
+            "Removing stale legacy tariff entity %s in favor of %s",
+            old_entity_id,
+            new_entity_id,
+        )
+        entity_registry.async_remove(old_entity_id)
+
+        if new_entity_id != old_entity_id:
+            entity_registry.async_update_entity(
+                new_entity_id,
+                new_entity_id=old_entity_id,
+            )
+
+
 def _build_meter_entities(
     hass: HomeAssistant,
     plan: MeterPlan,
@@ -534,6 +592,7 @@ async def async_setup_entry(
     entities: list[GlowSensor] = []
     daily_coordinators: dict[str, DataCoordinator] = {}
     tariff_coordinators: dict[str, TariffCoordinator] = {}
+    entity_registry = er.async_get(hass)
 
     glow_client = hass.data[DOMAIN][entry.entry_id]["client"]
     daily_interval = hass.data[DOMAIN][entry.entry_id].get(CONF_DAILY_INTERVAL, 15)
@@ -589,6 +648,7 @@ async def async_setup_entry(
         for plan in plan_virtual_entity_meters(
             virtual_entity, resources, logger=_LOGGER
         ):
+            _reconcile_tariff_entity_registry(entity_registry, entry.entry_id, plan)
             entities.extend(
                 _build_meter_entities(
                     hass,

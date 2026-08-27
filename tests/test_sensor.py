@@ -29,18 +29,23 @@ pytestmark = [
 ]
 
 
-async def _setup_integration(hass, client: FakeGlowClient) -> MockConfigEntry:
+async def _setup_integration(
+    hass,
+    client: FakeGlowClient,
+    entry: MockConfigEntry | None = None,
+) -> MockConfigEntry:
     """Set up the Glowmarkt config entry against the fake client."""
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={"username": "user@example.com", "password": "secret"},
-        version=6,
-        options={
-            CONF_DAILY_INTERVAL: 15,
-            CONF_TARIFF_INTERVAL: 60,
-        },
-    )
-    entry.add_to_hass(hass)
+    if entry is None:
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={"username": "user@example.com", "password": "secret"},
+            version=6,
+            options={
+                CONF_DAILY_INTERVAL: 15,
+                CONF_TARIFF_INTERVAL: 60,
+            },
+        )
+        entry.add_to_hass(hass)
 
     with patch("custom_components.glowmarkt.GlowClient", return_value=client):
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -320,3 +325,169 @@ async def test_tariff_entities_fall_back_to_usage_resource_without_cost(
     assert float(standing_state.state) == 0.479
     assert standing_state.attributes["unit_of_measurement"] == "GBP/day"
     assert float(rate_state.state) == 0.245
+
+
+async def test_setup_migrates_legacy_tariff_unique_ids_to_cost_resource(
+    hass,
+) -> None:
+    client = FakeGlowClient(
+        [
+            FakeGlowVirtualEntity(
+                "ve-1",
+                "Site 1",
+                resources=[
+                    FakeGlowResource(
+                        "electricity-usage",
+                        ELEC_CONSUMPTION_CLASSIFIER,
+                        "electricity consumption DCC SM profile reads",
+                        daily_total=4.2,
+                    ),
+                    FakeGlowResource(
+                        "electricity-cost",
+                        ELEC_COST_CLASSIFIER,
+                        "electricity cost DCC SM profile reads",
+                        base_unit="pence",
+                        daily_total=77.0,
+                    ),
+                ],
+            )
+        ]
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"username": "user@example.com", "password": "secret"},
+        version=6,
+        options={
+            CONF_DAILY_INTERVAL: 15,
+            CONF_TARIFF_INTERVAL: 60,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    entity_registry = er.async_get(hass)
+    old_rate = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "electricity-usage_rate",
+        config_entry=entry,
+        suggested_object_id="site_1_smart_electricity_meter_rate",
+        original_name="Rate",
+    )
+    old_standing = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "electricity-usage_standing_charge",
+        config_entry=entry,
+        suggested_object_id="site_1_smart_electricity_meter_standing_charge",
+        original_name="Standing charge",
+    )
+
+    await _setup_integration(hass, client, entry)
+
+    assert _entity_id(hass, "electricity-usage_rate") is None
+    assert _entity_id(hass, "electricity-usage_standing_charge") is None
+    assert _entity_id(hass, "electricity-cost_rate") == old_rate.entity_id
+    assert _entity_id(hass, "electricity-cost_standing_charge") == old_standing.entity_id
+
+    rate_state = hass.states.get(old_rate.entity_id)
+    standing_state = hass.states.get(old_standing.entity_id)
+    assert rate_state is not None
+    assert standing_state is not None
+    assert float(rate_state.state) == 0.245
+    assert float(standing_state.state) == 0.479
+
+
+async def test_setup_removes_duplicate_legacy_tariff_entities(
+    hass,
+) -> None:
+    client = FakeGlowClient(
+        [
+            FakeGlowVirtualEntity(
+                "ve-1",
+                "Site 1",
+                resources=[
+                    FakeGlowResource(
+                        "electricity-usage",
+                        ELEC_CONSUMPTION_CLASSIFIER,
+                        "electricity consumption DCC SM profile reads",
+                        daily_total=4.2,
+                    ),
+                    FakeGlowResource(
+                        "electricity-cost",
+                        ELEC_COST_CLASSIFIER,
+                        "electricity cost DCC SM profile reads",
+                        base_unit="pence",
+                        daily_total=77.0,
+                    ),
+                ],
+            )
+        ]
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"username": "user@example.com", "password": "secret"},
+        version=6,
+        options={
+            CONF_DAILY_INTERVAL: 15,
+            CONF_TARIFF_INTERVAL: 60,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    entity_registry = er.async_get(hass)
+    old_rate = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "electricity-usage_rate",
+        config_entry=entry,
+        suggested_object_id="site_1_smart_electricity_meter_rate",
+        original_name="Rate",
+    )
+    old_standing = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "electricity-usage_standing_charge",
+        config_entry=entry,
+        suggested_object_id="site_1_smart_electricity_meter_standing_charge",
+        original_name="Standing charge",
+    )
+    new_rate = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "electricity-cost_rate",
+        config_entry=entry,
+        suggested_object_id="site_1_smart_electricity_meter_rate",
+        original_name="Rate",
+    )
+    new_standing = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "electricity-cost_standing_charge",
+        config_entry=entry,
+        suggested_object_id="site_1_smart_electricity_meter_standing_charge",
+        original_name="Standing charge",
+    )
+
+    assert new_rate.entity_id != old_rate.entity_id
+    assert new_standing.entity_id != old_standing.entity_id
+
+    await _setup_integration(hass, client, entry)
+
+    assert _entity_id(hass, "electricity-usage_rate") is None
+    assert _entity_id(hass, "electricity-usage_standing_charge") is None
+    assert entity_registry.async_get(new_rate.entity_id) is None
+    assert entity_registry.async_get(new_standing.entity_id) is None
+
+    migrated_rate_entity_id = _entity_id(hass, "electricity-cost_rate")
+    migrated_standing_entity_id = _entity_id(
+        hass, "electricity-cost_standing_charge"
+    )
+    assert migrated_rate_entity_id == old_rate.entity_id
+    assert migrated_standing_entity_id == old_standing.entity_id
+
+    rate_state = hass.states.get(migrated_rate_entity_id)
+    standing_state = hass.states.get(migrated_standing_entity_id)
+    assert rate_state is not None
+    assert standing_state is not None
+    assert float(rate_state.state) == 0.245
+    assert float(standing_state.state) == 0.479
